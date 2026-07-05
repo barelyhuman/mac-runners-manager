@@ -30,7 +30,7 @@ func hostEnv(name string) string {
 	return os.Getenv(name)
 }
 
-func hostExec(cmd string, args ...string) string {
+func hostExec(cmd string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
 	defer cancel()
 
@@ -39,9 +39,9 @@ func hostExec(cmd string, args ...string) string {
 	c.Stdout = &out
 	c.Stderr = &stderr
 	if err := c.Run(); err != nil {
-		panic(fmt.Sprintf("exec(%q, %v) failed: %v: %s", cmd, args, err, stderr.String()))
+		return "", fmt.Errorf("exec(%q, %v) failed: %v: %s", cmd, args, err, stderr.String())
 	}
-	return strings.TrimRight(out.String(), "\n")
+	return strings.TrimRight(out.String(), "\n"), nil
 }
 
 func hostLog(args ...interface{}) {

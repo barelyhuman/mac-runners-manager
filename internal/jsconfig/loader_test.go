@@ -136,3 +136,14 @@ func TestAuth_ThrowingFunctionReturnsError(t *testing.T) {
 		t.Fatal("expected error when auth() throws")
 	}
 }
+
+func TestAuth_ExecFailureReturnsError(t *testing.T) {
+	cfg, err := Load("testdata/bad_exec.config.js")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	_, err = cfg.Auth(context.Background())
+	if err == nil {
+		t.Fatal("expected error when exec() fails")
+	}
+}

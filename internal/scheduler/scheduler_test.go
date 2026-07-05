@@ -358,7 +358,7 @@ func TestTick_ProvisioningFailureMarksFailedThenDrains(t *testing.T) {
 	}
 }
 
-func TestReconcileOnStartup_AdoptsOrphanVMs(t *testing.T) {
+func TestReconcileOnStartup_WarnsOnOrphanVMs(t *testing.T) {
 	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
 	ds := &fakeDemandSource{}
 	prov := newFakeProvisioner()
@@ -370,14 +370,14 @@ func TestReconcileOnStartup_AdoptsOrphanVMs(t *testing.T) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	adopted := 0
+	running := 0
 	for _, vm := range s.vms {
 		if vm.State == Running {
-			adopted++
+			running++
 		}
 	}
-	if adopted != 1 {
-		t.Errorf("expected 1 adopted VM, got %d", adopted)
+	if running != 0 {
+		t.Errorf("expected 0 adopted VMs, got %d", running)
 	}
 }
 

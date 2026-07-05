@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -78,6 +79,9 @@ func New(cfg Config) *Scheduler {
 	if debug == nil {
 		debug = log.New(io.Discard, "", 0)
 	}
+	if cfg.ForceSpawn {
+		log.Printf("scheduler: WARNING: forceSpawn is enabled; VMs will be provisioned regardless of queued-job demand")
+	}
 	return &Scheduler{
 		demand:       cfg.Demand,
 		provisioner:  cfg.Provisioner,
@@ -144,9 +148,8 @@ func (s *Scheduler) shutdown() {
 	}
 }
 
-// ReconcileOnStartup adopts any VMs already running under our naming prefix
-// (e.g. after a crash/restart) as Running-with-unknown-target, rather than
-// killing them — they may be serving an in-flight job.
+// ReconcileOnStartup checks for orphan VMs from a previous run and warns
+// the user to stop and delete them manually rather than adopting them.
 func (s *Scheduler) ReconcileOnStartup(ctx context.Context) {
 	names, err := s.provisioner.List(ctx)
 	if err != nil {
@@ -154,21 +157,15 @@ func (s *Scheduler) ReconcileOnStartup(ctx context.Context) {
 		return
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	var orphans []string
 	for _, name := range names {
-		if len(name) <= len(instanceNamePrefix) || name[:len(instanceNamePrefix)] != instanceNamePrefix {
-			continue
+		if strings.HasPrefix(name, instanceNamePrefix) {
+			orphans = append(orphans, name)
 		}
-		for _, vm := range s.vms {
-			if vm.State == Idle {
-				vm.InstanceName = name
-				vm.State = Running
-				vm.AssignedAt = time.Now()
-				log.Printf("scheduler: adopted orphan VM %s as Running", name)
-				break
-			}
-		}
+	}
+	if len(orphans) > 0 {
+		log.Printf("scheduler: WARNING: found %d orphan VM(s) from a previous run: %v", len(orphans), orphans)
+		log.Printf("scheduler: please stop and delete these VMs manually, then restart the agent")
 	}
 }
 
@@ -380,7 +377,7 @@ const maxInstanceNameLen = 64
 // GitHub runner name: alphanumerics/hyphens only, <=64 chars. GitHub rejects
 // '/' (present in TargetRef.Key()) and names over 64 chars.
 func buildInstanceName(target TargetRef, id string) string {
-	sanitizedKey := targetNameSanitizer.Replace(target.Key())
+	sanitizedKey := targetNameSanitizer.ReplaceAllString(target.Key(), "")
 	suffix := "-" + id
 	prefixBudget := maxInstanceNameLen - len(instanceNamePrefix) - len(suffix)
 	if prefixBudget < 0 {
@@ -392,7 +389,7 @@ func buildInstanceName(target TargetRef, id string) string {
 	return instanceNamePrefix + sanitizedKey + suffix
 }
 
-var targetNameSanitizer = strings.NewReplacer("/", "-")
+var targetNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
 func (s *Scheduler) provision(ctx context.Context, vm *VM, target TargetRef) error {
 	instanceName := buildInstanceName(target, s.genID())
