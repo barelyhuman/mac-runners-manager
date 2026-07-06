@@ -6,6 +6,26 @@ It polls each configured repo for queued jobs, decides which repo should get the
 
 Apple's EULA caps concurrent macOS VMs at 2 on a single physical Mac — the pool size defaults to 2 for this reason, but is configurable.
 
+## Quick Start
+
+```sh
+go install github.com/barelyhuman/mac-runners-manager/cmd/manager@latest
+```
+
+Or, without a local Go toolchain, via [goblin.run](https://goblin.run):
+
+```sh
+curl -sf https://goblin.run/github.com/barelyhuman/mac-runners-manager | CMD_PATH=/cmd/manager sh 
+```
+
+Then copy [configs/example.config.js](configs/example.config.js), fill in your repo(s) and auth, and run it (see [Running](#running) below).
+
+## Who is it for ?
+
+Anyone running self-hosted GitHub Actions runners on macOS or Linux VMs who wants to share a small, fixed pool of machines across multiple repos instead of dedicating VMs per repo or per job.
+
+Running Tart VMs by hand works fine for a single repo with steady load, but it breaks down once you have several repos competing for the same limited hardware — especially on macOS, where Apple's EULA caps you at 2 concurrent VMs per physical Mac. This agent handles the parts that get tedious to do manually: watching multiple repos for queued jobs, deciding fairly who gets the next free VM, JIT-registering a fresh runner per job (so runners are never reused or left orphaned), and reclaiming the VM the moment the job finishes so it's ready for the next repo in line.
+
 ## How allocation works
 
 Given `N` idle VMs and demand from multiple repos, each tick:
