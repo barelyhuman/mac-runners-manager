@@ -43,16 +43,16 @@ func TestClone_BuildsExpectedArgs(t *testing.T) {
 
 func TestBootArgs_IncludesNetBridgedFlagWhenConfigured(t *testing.T) {
 	c := NewClient("tart", t.TempDir(), nil).WithNetBridged("en0")
-	want := []string{"run", "instance-1", "--no-graphics", "--dir", "runner:/tmp/payload", "--net-bridged=en0"}
-	if got := c.bootArgs("instance-1", "/tmp/payload"); !equalArgs(got, want) {
+	want := []string{"run", "instance-1", "--no-graphics", "--net-bridged=en0"}
+	if got := c.bootArgs("instance-1"); !equalArgs(got, want) {
 		t.Errorf("bootArgs = %v, want %v", got, want)
 	}
 }
 
 func TestBootArgs_OmitsNetBridgedFlagByDefault(t *testing.T) {
 	c := NewClient("tart", t.TempDir(), nil)
-	want := []string{"run", "instance-1", "--no-graphics", "--dir", "runner:/tmp/payload"}
-	if got := c.bootArgs("instance-1", "/tmp/payload"); !equalArgs(got, want) {
+	want := []string{"run", "instance-1", "--no-graphics"}
+	if got := c.bootArgs("instance-1"); !equalArgs(got, want) {
 		t.Errorf("bootArgs = %v, want %v", got, want)
 	}
 }

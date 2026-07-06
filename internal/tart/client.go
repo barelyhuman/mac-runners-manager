@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/usebruno/mac-action-agent/internal/scheduler"
+	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 )
 
 // execFunc runs a command and returns its combined stdout/stderr output.
@@ -86,39 +86,20 @@ func (c *Client) Clone(ctx context.Context, baseImage, instanceName string) erro
 	return err
 }
 
-// payloadDir returns (and ensures exists) the scratch directory mounted into
-// a given VM instance to deliver its JIT registration config at boot.
-func (c *Client) payloadDir(instanceName string) (string, error) {
-	dir := filepath.Join(c.baseDir, instanceName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", fmt.Errorf("create payload dir: %w", err)
-	}
-	return dir, nil
-}
-
-// bootArgs builds the `tart run` argument list for booting instanceName with
-// its payload directory mounted, applying bridged networking if configured.
-func (c *Client) bootArgs(instanceName, payloadDir string) []string {
-	args := []string{"run", instanceName, "--no-graphics", "--dir", "runner:" + payloadDir}
+// bootArgs builds the `tart run` argument list for booting instanceName,
+// applying bridged networking if configured.
+func (c *Client) bootArgs(instanceName string) []string {
+	args := []string{"run", instanceName, "--no-graphics"}
 	if c.netBridged != "" {
 		args = append(args, "--net-bridged="+c.netBridged)
 	}
 	return args
 }
 
-// Boot starts the VM headless, mounting a directory containing the JIT
-// registration payload that the golden image's boot-time agent reads.
+// Boot starts the VM headless. The JIT config is no longer mounted into the
+// guest; the scheduler delivers it over SSH after the guest boots.
 func (c *Client) Boot(ctx context.Context, instanceName string, payload scheduler.BootPayload) error {
-	dir, err := c.payloadDir(instanceName)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "jitconfig"), []byte(payload.JITConfig), 0o600); err != nil {
-		return fmt.Errorf("write jitconfig payload: %w", err)
-	}
-
-	args := c.bootArgs(instanceName, dir)
+	args := c.bootArgs(instanceName)
 
 	c.debug.Printf("tart: starting detached %s %v", c.binary, args)
 	cmd := exec.CommandContext(context.Background(), c.binary, args...)

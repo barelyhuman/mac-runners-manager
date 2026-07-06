@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"io"
 	"time"
 )
 
@@ -48,6 +49,38 @@ type VMProvisioner interface {
 	Stop(ctx context.Context, instanceName string) error
 	Delete(ctx context.Context, instanceName string) error
 	List(ctx context.Context) ([]string, error)
+	// IP resolves the guest IP of a running instance, waiting up to
+	// waitSeconds for networking to come up.
+	IP(ctx context.Context, instanceName string, waitSeconds int) (string, error)
+}
+
+// GuestRunnerProvisioner orchestrates the installation and startup of a
+// GitHub Actions runner inside a VM over SSH.
+type GuestRunnerProvisioner interface {
+	// IsInstalled reports whether the runner is already present in the guest.
+	IsInstalled(ctx context.Context, ip string) (bool, error)
+	// Install downloads and extracts the GitHub Actions runner for the
+	// requested version tag (empty = latest).
+	Install(ctx context.Context, ip, versionTag string) error
+	// Version returns the installed runner version or an empty string.
+	Version(ctx context.Context, ip string) (string, error)
+	// WriteJITConfig writes the base64-encoded JIT config to a temp file
+	// inside the guest and returns the guest-side path.
+	WriteJITConfig(ctx context.Context, ip, jitConfig string) (string, error)
+	// StartRunner launches run.sh --jitconfig inside the guest in the
+	// background (via nohup).
+	StartRunner(ctx context.Context, ip, jitConfigPath string) error
+	// KillRunner terminates any existing run.sh process in the guest.
+	KillRunner(ctx context.Context, ip string) error
+	// TailLogs returns a ReadCloser streaming the runner diag logs.
+	// The caller is responsible for closing it.
+	TailLogs(ctx context.Context, ip string) (io.ReadCloser, error)
+}
+
+// RunnerCleaner force-removes a stale self-hosted runner registration from
+// GitHub so that a fresh JIT config can be minted for the same VM.
+type RunnerCleaner interface {
+	DeleteRunnerByName(ctx context.Context, target TargetRef, runnerName string) error
 }
 
 // RunnerRegistrar bridges GitHub's JIT config API to the scheduler.

@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
-	"github.com/usebruno/mac-action-agent/internal/scheduler"
+	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 )
 
 const (
@@ -22,12 +22,21 @@ const (
 
 // ResolvedConfig is the fully-decoded result of loading a config.js file.
 type ResolvedConfig struct {
-	Auth         func(ctx context.Context) (string, error)
-	Priority     scheduler.PriorityFunc
-	Targets      []scheduler.TargetRef
-	PoolSize     int
-	TickInterval time.Duration
-	ForceSpawn   bool
+	Auth             func(ctx context.Context) (string, error)
+	Priority         scheduler.PriorityFunc
+	Targets          []scheduler.TargetRef
+	PoolSize         int
+	TickInterval     time.Duration
+	ForceSpawn       bool
+	RunnerVersion    string            // optional: GitHub Actions runner version tag, e.g. "2.335.1"
+	SSHCredentials   SSHCredentials    // optional: overrides CLI flags if set
+}
+
+// SSHCredentials describes how the agent should authenticate to VM guests
+type SSHCredentials struct {
+	User     string
+	Password string
+	KeyPath  string
 }
 
 // JSConfig wraps a loaded goja.Runtime. goja.Runtime is not safe for
@@ -113,12 +122,34 @@ func Load(path string) (*ResolvedConfig, error) {
 		forceSpawn = v.ToBoolean()
 	}
 
+	runnerVersion := ""
+	if v := exportsObj.Get("runnerVersion"); v != nil && !goja.IsUndefined(v) {
+		runnerVersion = v.String()
+	}
+
+	sshCreds := SSHCredentials{}
+	if v := exportsObj.Get("sshCredentials"); v != nil && !goja.IsUndefined(v) {
+		if m, ok := v.Export().(map[string]interface{}); ok {
+			if u, ok := m["user"].(string); ok {
+				sshCreds.User = u
+			}
+			if p, ok := m["password"].(string); ok {
+				sshCreds.Password = p
+			}
+			if k, ok := m["keyPath"].(string); ok {
+				sshCreds.KeyPath = k
+			}
+		}
+	}
+
 	rc := &ResolvedConfig{
-		Auth:         jc.Auth,
-		Targets:      targets,
-		PoolSize:     poolSize,
-		TickInterval: tickInterval,
-		ForceSpawn:   forceSpawn,
+		Auth:           jc.Auth,
+		Targets:        targets,
+		PoolSize:       poolSize,
+		TickInterval:   tickInterval,
+		ForceSpawn:     forceSpawn,
+		RunnerVersion:  runnerVersion,
+		SSHCredentials: sshCreds,
 	}
 	if jc.priority != nil {
 		rc.Priority = jc.Priority

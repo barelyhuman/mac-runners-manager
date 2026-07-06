@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +111,26 @@ func (f *fakeProvisioner) setRunning(instanceName string, running bool) {
 	f.running[instanceName] = running
 }
 
+func (f *fakeProvisioner) IP(ctx context.Context, instanceName string, waitSeconds int) (string, error) {
+	return "192.0.2.1", nil
+}
+
+// fakeGuestProvisioner simulates a working SSH-based runner setup inside
+// the guest. All operations succeed instantly.
+type fakeGuestProvisioner struct{}
+
+func (f *fakeGuestProvisioner) IsInstalled(ctx context.Context, ip string) (bool, error)   { return true, nil }
+func (f *fakeGuestProvisioner) Install(ctx context.Context, ip, versionTag string) error   { return nil }
+func (f *fakeGuestProvisioner) Version(ctx context.Context, ip string) (string, error)     { return "2.0.0", nil }
+func (f *fakeGuestProvisioner) WriteJITConfig(ctx context.Context, ip, jitConfig string) (string, error) {
+	return "/tmp/.jitconfig", nil
+}
+func (f *fakeGuestProvisioner) StartRunner(ctx context.Context, ip, jitConfigPath string) error { return nil }
+func (f *fakeGuestProvisioner) KillRunner(ctx context.Context, ip string) error               { return nil }
+func (f *fakeGuestProvisioner) TailLogs(ctx context.Context, ip string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
 // fakeRegistrar always succeeds with a canned payload.
 type fakeRegistrar struct {
 	mu    sync.Mutex
@@ -152,6 +173,7 @@ func testScheduler(t *testing.T, poolSize int, targets []TargetRef, ds *fakeDema
 		Demand:      ds,
 		Provisioner: prov,
 		Registrar:   reg,
+		GuestRunner: &fakeGuestProvisioner{},
 		Targets:     targets,
 		PoolSize:    poolSize,
 		TickEvery:   time.Hour,
@@ -251,10 +273,7 @@ func TestFullLifecycle_ProvisioningToRunningToIdle(t *testing.T) {
 
 	s := testScheduler(t, 1, targets, ds, prov, reg)
 
-	// Tick 1: provisions the only idle VM. fakeProvisioner.Boot marks it
-	// running immediately, but confirmation only happens via
-	// reconcileVMStates at the start of a *later* tick (by design, so a tick
-	// stays fast/non-blocking) - so state is still Provisioning right after.
+	// Tick 1: provisions the only idle VM.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 1: %v", err)
 	}
@@ -272,23 +291,34 @@ func TestFullLifecycle_ProvisioningToRunningToIdle(t *testing.T) {
 	// No more demand - nothing new should provision on subsequent ticks.
 	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
 
-	// Tick 2: reconcileVMStates confirms the VM is now Running.
+	// Tick 2: reconcileVMStates resolves IP and launches runner inside guest.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 2: %v", err)
 	}
 	s.mu.Lock()
 	state = s.vms[0].State
 	s.mu.Unlock()
+	if state != Provisioning {
+		t.Fatalf("expected VM Provisioning while runner launching, got %v", state)
+	}
+
+	// Tick 3: reconcileVMStates confirms runner is online on GitHub.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+	s.mu.Lock()
+	state = s.vms[0].State
+	s.mu.Unlock()
 	if state != Running {
-		t.Fatalf("expected VM Running after Tick 2 reconciliation, got %v", state)
+		t.Fatalf("expected VM Running after Tick 3 reconciliation, got %v", state)
 	}
 
 	// Simulate the ephemeral runner finishing its one job and deregistering.
 	prov.setRunning(instanceName, false)
 
-	// Tick 3: reconcileVMStates notices the runner exited, drains, returns to Idle.
+	// Tick 4: reconcileVMStates notices the runner exited, drains, returns to Idle.
 	if err := s.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 3: %v", err)
+		t.Fatalf("Tick 4: %v", err)
 	}
 
 	s.mu.Lock()
@@ -362,7 +392,7 @@ func TestReconcileOnStartup_WarnsOnOrphanVMs(t *testing.T) {
 	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
 	ds := &fakeDemandSource{}
 	prov := newFakeProvisioner()
-	prov.setRunning("mac-action-agent-acme/repo1-orphan123", true)
+	prov.setRunning("mac-runners-manager-acme/repo1-orphan123", true)
 	reg := &fakeRegistrar{}
 
 	s := testScheduler(t, 2, targets, ds, prov, reg)
@@ -605,13 +635,26 @@ func TestReconcileProvisioning_PromotesToRunningOnceGitHubReportsOnline(t *testi
 	s.mu.Unlock()
 	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
 
-	rs.setOnline(instanceName, true)
-
+	// Tick 2: reconcileVMStates resolves IP and launches runner.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 2: %v", err)
 	}
 	s.mu.Lock()
 	state := s.vms[0].State
+	s.mu.Unlock()
+	if state != Provisioning {
+		t.Fatalf("expected VM Provisioning while runner launching, got %v", state)
+	}
+
+	// Now mark the runner online on GitHub.
+	rs.setOnline(instanceName, true)
+
+	// Tick 3: reconcileVMStates sees GitHub online and promotes to Running.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+	s.mu.Lock()
+	state = s.vms[0].State
 	s.mu.Unlock()
 	if state != Running {
 		t.Fatalf("expected VM Running once GitHub reports the runner online, got %v", state)
@@ -633,14 +676,20 @@ func TestReconcileProvisioning_FailsAfterTimeoutIfGitHubNeverReportsOnline(t *te
 	}
 	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
 
+	// Tick 2: reconcileVMStates resolves IP and launches runner.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+
 	// Backdate AssignedAt past provisioningTimeout to simulate elapsed time
 	// without a real sleep.
 	s.mu.Lock()
 	s.vms[0].AssignedAt = time.Now().Add(-provisioningTimeout - time.Second)
 	s.mu.Unlock()
 
+	// Tick 3: runner launched but never online and provisioning timed out.
 	if err := s.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 2: %v", err)
+		t.Fatalf("Tick 3: %v", err)
 	}
 	s.mu.Lock()
 	state := s.vms[0].State
@@ -667,25 +716,31 @@ func TestReconcileRunning_DrainsAfterGitHubOfflineGracePeriod(t *testing.T) {
 	instanceName := s.vms[0].InstanceName
 	s.mu.Unlock()
 	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
-	rs.setOnline(instanceName, true)
 
-	// Tick 2: promotes to Running (tart alive, GitHub online).
+	// Tick 2: reconcileVMStates resolves IP and launches runner.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 2: %v", err)
+	}
+
+	rs.setOnline(instanceName, true)
+
+	// Tick 3: promotes to Running (tart alive, GitHub online).
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
 	}
 	s.mu.Lock()
 	state := s.vms[0].State
 	s.mu.Unlock()
 	if state != Running {
-		t.Fatalf("expected Running after Tick 2, got %v", state)
+		t.Fatalf("expected Running after Tick 3, got %v", state)
 	}
 
 	// Runner goes offline on GitHub while tart still reports the process alive.
 	rs.setOnline(instanceName, false)
 
-	// Tick 3: within grace period, VM should remain Running, not drained yet.
+	// Tick 4: within grace period, VM should remain Running, not drained yet.
 	if err := s.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 3: %v", err)
+		t.Fatalf("Tick 4: %v", err)
 	}
 	s.mu.Lock()
 	state = s.vms[0].State
@@ -704,9 +759,9 @@ func TestReconcileRunning_DrainsAfterGitHubOfflineGracePeriod(t *testing.T) {
 	s.vms[0].GitHubOfflineSince = time.Now().Add(-githubOfflineGrace - time.Second)
 	s.mu.Unlock()
 
-	// Tick 4: past grace period, VM should be drained back to Idle.
+	// Tick 5: past grace period, VM should be drained back to Idle.
 	if err := s.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 4: %v", err)
+		t.Fatalf("Tick 5: %v", err)
 	}
 	s.mu.Lock()
 	state = s.vms[0].State
@@ -733,15 +788,22 @@ func TestReconcileRunning_RecoversFromTransientGitHubOfflineBlip(t *testing.T) {
 	instanceName := s.vms[0].InstanceName
 	s.mu.Unlock()
 	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
-	rs.setOnline(instanceName, true)
 
+	// Tick 2: reconcileVMStates resolves IP and launches runner.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 2: %v", err)
 	}
 
-	rs.setOnline(instanceName, false)
+	rs.setOnline(instanceName, true)
+
+	// Tick 3: promotes to Running.
 	if err := s.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick 3: %v", err)
+	}
+
+	rs.setOnline(instanceName, false)
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 4: %v", err)
 	}
 	s.mu.Lock()
 	offlineSince := s.vms[0].GitHubOfflineSince
@@ -752,7 +814,7 @@ func TestReconcileRunning_RecoversFromTransientGitHubOfflineBlip(t *testing.T) {
 
 	rs.setOnline(instanceName, true)
 	if err := s.Tick(context.Background()); err != nil {
-		t.Fatalf("Tick 4: %v", err)
+		t.Fatalf("Tick 5: %v", err)
 	}
 	s.mu.Lock()
 	state := s.vms[0].State

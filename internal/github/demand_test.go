@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	gh "github.com/google/go-github/v66/github"
-	"github.com/usebruno/mac-action-agent/internal/scheduler"
+	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 )
 
 // newTestServerClient builds a go-github client pointed at a local

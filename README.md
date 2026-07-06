@@ -1,4 +1,4 @@
-# mac-action-agent
+# mac-runners-manager
 
 A tiny Go binary that manages a small, fixed pool of [Tart](https://github.com/cirruslabs/tart) VMs (macOS or Linux) and cycles them between GitHub repos as ephemeral, JIT-registered self-hosted Actions runners.
 
@@ -37,8 +37,8 @@ The config file runs in an embedded JS engine (goja) with two host functions: `e
 ## Running
 
 ```sh
-go build -o mac-action-agent ./cmd/mac-action-agent
-./mac-action-agent -config configs/example.config.js -base-image my-golden-image -tart-binary tart
+go build -o agent ./cmd/manager
+./manager -config configs/example.config.js -base-image my-golden-image
 ```
 
 Flags:
@@ -46,7 +46,7 @@ Flags:
 - `-config` — path to the JS config file (default `config.js`)
 - `-base-image` — golden Tart image to clone for each ephemeral VM (required)
 - `-tart-binary` — path to the `tart` CLI (default `tart`, resolved via `PATH`)
-- `-state-dir` — scratch directory for per-VM boot payloads (default `/tmp/mac-action-agent`)
+- `-state-dir` — scratch directory for per-VM boot payloads (default `/tmp/mac-runners-manager`)
 - `-net-bridged` — host network interface (e.g. `en0`) to bridge VMs onto so the host can SSH into them directly by IP; leave empty to use tart's default shared/NAT networking. Requires Remote Login to be enabled on the golden image. Run `tart run <image> --net-bridged=list` to see available interface names.
 
 ## Development

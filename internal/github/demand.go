@@ -1,4 +1,4 @@
-// Package github implements the GitHub-facing pieces of mac-action-agent:
+// Package github implements the GitHub-facing pieces of mac-runners-manager:
 // polling for queued jobs and minting JIT runner registration configs.
 package github
 
@@ -9,7 +9,7 @@ import (
 	"log"
 
 	gh "github.com/google/go-github/v66/github"
-	"github.com/usebruno/mac-action-agent/internal/scheduler"
+	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 )
 
 // AuthFunc resolves the GitHub PAT to use for API calls. Implemented by

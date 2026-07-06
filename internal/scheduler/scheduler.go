@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -14,14 +15,28 @@ import (
 )
 
 const (
-	provisioningTimeout = 2 * time.Minute
-	instanceNamePrefix  = "mac-action-agent-"
+	// provisioningTimeout is the total budget for a VM to go from Provisioning
+	// to Running (boot + IP + SSH + download + launch + GitHub confirmation).
+	provisioningTimeout = 3 * time.Minute
+	instanceNamePrefix  = "mac-runners-manager-"
 
 	// githubOfflineGrace bounds how long a Running VM may be reported
 	// offline/missing by GitHub before it's drained. Short transient
 	// blips (a slow status update after a job finishes) shouldn't cause
 	// a healthy runner to be torn down mid-flight.
 	githubOfflineGrace = 1 * time.Minute
+
+	// runnerOnlineTimeout is how long we wait after launching run.sh for
+	// GitHub to report the runner online. If this elapses we assume the
+	// JIT config expired and retry with a fresh one.
+	runnerOnlineTimeout = 90 * time.Second
+
+	// jitRetryMax is the maximum number of JIT regeneration attempts.
+	jitRetryMax = 2
+
+	// sshReadyWait is the maximum time to wait for a guest SSH daemon to
+	// accept connections after its IP has been resolved.
+	sshReadyWait = 2 * time.Minute
 )
 
 // idGenerator produces unique instance name suffixes. Overridable in tests
@@ -31,18 +46,22 @@ type idGenerator func() string
 // Scheduler owns the fixed-size VM pool and runs the periodic
 // demand -> allocation -> provisioning loop.
 type Scheduler struct {
-	demand       DemandSource
-	provisioner  VMProvisioner
-	registrar    RunnerRegistrar
-	runnerStatus RunnerStatusChecker
-	auth         func(ctx context.Context) (string, error)
-	priority    PriorityFunc
-	targets     []TargetRef
-	baseImage   string
-	tickEvery   time.Duration
-	genID       idGenerator
-	debug       *log.Logger
-	forceSpawn  bool
+	demand        DemandSource
+	provisioner   VMProvisioner
+	registrar     RunnerRegistrar
+	runnerStatus  RunnerStatusChecker
+	runnerCleaner RunnerCleaner
+	guestRunner   GuestRunnerProvisioner
+	auth          func(ctx context.Context) (string, error)
+	priority      PriorityFunc
+	targets       []TargetRef
+	baseImage     string
+	tickEvery     time.Duration
+	genID         idGenerator
+	debug         *log.Logger
+	forceSpawn    bool
+	runnerVersion string
+	tailLogs      bool
 
 	mu  sync.Mutex
 	vms []*VM
@@ -51,15 +70,18 @@ type Scheduler struct {
 // Config bundles the dependencies and settings needed to construct a
 // Scheduler.
 type Config struct {
-	Demand       DemandSource
-	Provisioner  VMProvisioner
-	Registrar    RunnerRegistrar
-	RunnerStatus RunnerStatusChecker
-	Targets      []TargetRef
-	Priority    PriorityFunc
-	PoolSize    int
-	TickEvery   time.Duration
-	BaseImage   string
+	Demand        DemandSource
+	Provisioner   VMProvisioner
+	Registrar     RunnerRegistrar
+	RunnerStatus  RunnerStatusChecker
+	RunnerCleaner RunnerCleaner
+	GuestRunner   GuestRunnerProvisioner
+	Targets       []TargetRef
+	Priority      PriorityFunc
+	PoolSize      int
+	TickEvery     time.Duration
+	BaseImage     string
+	RunnerVersion string
 	// Debug receives verbose tracing of the tick loop's decisions. Nil
 	// disables debug logging.
 	Debug *log.Logger
@@ -67,6 +89,9 @@ type Config struct {
 	// entire idle pool with runners for that target once at startup,
 	// bypassing queued-job demand entirely. Ignored with multiple targets.
 	ForceSpawn bool
+	// TailLogs starts a background goroutine per Running VM that streams
+	// the runner diagnostic logs back to the agent's stdout.
+	TailLogs bool
 }
 
 // New constructs a Scheduler with a fixed-size pool of idle VM slots.
@@ -83,18 +108,22 @@ func New(cfg Config) *Scheduler {
 		log.Printf("scheduler: WARNING: forceSpawn is enabled; VMs will be provisioned regardless of queued-job demand")
 	}
 	return &Scheduler{
-		demand:       cfg.Demand,
-		provisioner:  cfg.Provisioner,
-		registrar:    cfg.Registrar,
-		runnerStatus: cfg.RunnerStatus,
-		priority:     cfg.Priority,
-		targets:      cfg.Targets,
-		baseImage:    cfg.BaseImage,
-		tickEvery:    cfg.TickEvery,
-		vms:          vms,
-		genID:        defaultIDGenerator,
-		debug:        debug,
-		forceSpawn:   cfg.ForceSpawn,
+		demand:        cfg.Demand,
+		provisioner:   cfg.Provisioner,
+		registrar:     cfg.Registrar,
+		runnerStatus:  cfg.RunnerStatus,
+		runnerCleaner: cfg.RunnerCleaner,
+		guestRunner:   cfg.GuestRunner,
+		priority:      cfg.Priority,
+		targets:       cfg.Targets,
+		baseImage:     cfg.BaseImage,
+		tickEvery:     cfg.TickEvery,
+		vms:           vms,
+		genID:         defaultIDGenerator,
+		debug:         debug,
+		forceSpawn:    cfg.ForceSpawn,
+		runnerVersion: cfg.RunnerVersion,
+		tailLogs:      cfg.TailLogs,
 	}
 }
 
@@ -393,8 +422,10 @@ var targetNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
 func (s *Scheduler) provision(ctx context.Context, vm *VM, target TargetRef) error {
 	instanceName := buildInstanceName(target, s.genID())
+	// Generate JIT config eagerly; if provisioning is fast (pre-baked image)
+	// this JIT is used immediately. If the VM takes too long to boot, the
+	// JIT may expire and we regenerate in reconcileProvisioning.
 	s.debug.Printf("scheduler: %s: generating JIT config", instanceName)
-
 	payload, err := s.registrar.GenerateJITConfig(ctx, target, instanceName)
 	if err != nil {
 		return fmt.Errorf("generate JIT config: %w", err)
@@ -414,9 +445,10 @@ func (s *Scheduler) provision(ctx context.Context, vm *VM, target TargetRef) err
 	vm.InstanceName = instanceName
 	vm.Target = &target
 	vm.AssignedAt = time.Now()
+	vm.JITConfig = payload.JITConfig
 	s.mu.Unlock()
 
-	s.debug.Printf("scheduler: %s: boot command issued, will confirm via IsRunning on a later tick", instanceName)
+	s.debug.Printf("scheduler: %s: boot command issued, will confirm via reconcileVMStates on later ticks", instanceName)
 	return nil
 }
 
@@ -455,21 +487,201 @@ func (s *Scheduler) reconcileProvisioning(ctx context.Context, vm *VM) {
 		return
 	}
 
+	// VM is alive. Resolve guest IP if we haven't yet.
+	if vm.GuestIP == "" {
+		ip, err := s.resolveGuestIP(ctx, vm)
+		if err != nil {
+			log.Printf("scheduler: failed to resolve guest IP for %s: %v", vm.InstanceName, err)
+			s.failIfProvisioningTimedOut(vm)
+			return
+		}
+		s.mu.Lock()
+		vm.GuestIP = ip
+		s.mu.Unlock()
+		s.debug.Printf("scheduler: %s: guest IP resolved to %s", vm.InstanceName, ip)
+	}
+
+	// Launch the runner inside the guest if we haven't yet.
+	if !vm.RunnerLaunched && vm.GuestIP != "" {
+		if err := s.launchRunnerInGuest(ctx, vm); err != nil {
+			log.Printf("scheduler: failed to launch runner in %s: %v", vm.InstanceName, err)
+			s.failIfProvisioningTimedOut(vm)
+			return
+		}
+		// Runner is launched; GitHub confirmation happens on the next tick.
+		return
+	}
+
+	// Runner is launched. Check if GitHub shows it online.
 	online, err := s.checkRunnerOnline(ctx, vm)
 	if err != nil {
 		log.Printf("scheduler: runner status check failed for %s: %v", vm.InstanceName, err)
 		return
 	}
-	if !online {
-		s.debug.Printf("scheduler: %s: tart alive, runner not yet online on GitHub (%s elapsed)", vm.InstanceName, time.Since(vm.AssignedAt))
+	if online {
+		s.debug.Printf("scheduler: %s: confirmed running (tart alive, GitHub online)", vm.InstanceName)
+		s.mu.Lock()
+		vm.State = Running
+		s.mu.Unlock()
+		if s.tailLogs && s.guestRunner != nil {
+			go s.tailRunnerLogs(vm)
+		}
+		return
+	}
+
+	// Not online. If enough time passed since launch, the JIT may have expired.
+	if vm.RunnerLaunched && time.Since(vm.RunnerLaunchedAt) > runnerOnlineTimeout {
+		s.retryJITConfig(ctx, vm)
+		return
+	}
+
+	s.debug.Printf("scheduler: %s: tart alive, runner launched, not yet online on GitHub (%s since launch)", vm.InstanceName, time.Since(vm.RunnerLaunchedAt))
+	s.failIfProvisioningTimedOut(vm)
+}
+
+// resolveGuestIP resolves the VM's IP via tart and waits for SSH to be ready.
+func (s *Scheduler) resolveGuestIP(ctx context.Context, vm *VM) (string, error) {
+	ip, err := s.provisioner.IP(ctx, vm.InstanceName, 60)
+	if err != nil {
+		return "", fmt.Errorf("resolve IP: %w", err)
+	}
+	return ip, nil
+}
+
+// launchRunnerInGuest checks whether the runner binary is already present,
+// downloads it if needed, writes the JIT config, and starts run.sh.
+func (s *Scheduler) launchRunnerInGuest(ctx context.Context, vm *VM) error {
+	if s.guestRunner == nil {
+		return fmt.Errorf("no guest runner provisioner configured")
+	}
+
+	ip := vm.GuestIP
+	if ip == "" {
+		return fmt.Errorf("guest IP not resolved")
+	}
+
+	// Check if runner is already installed.
+	installed, err := s.guestRunner.IsInstalled(ctx, ip)
+	if err != nil {
+		return fmt.Errorf("check installed: %w", err)
+	}
+
+	if !installed {
+		s.debug.Printf("scheduler: %s: runner not installed, downloading version %q", vm.InstanceName, s.runnerVersion)
+		if err := s.guestRunner.Install(ctx, ip, s.runnerVersion); err != nil {
+			return fmt.Errorf("install runner: %w", err)
+		}
+	} else {
+		// If a version is pinned, check whether the installed version matches.
+		if s.runnerVersion != "" {
+			ver, err := s.guestRunner.Version(ctx, ip)
+			if err != nil {
+				s.debug.Printf("scheduler: %s: could not read installed runner version: %v", vm.InstanceName, err)
+			} else if ver != s.runnerVersion {
+				s.debug.Printf("scheduler: %s: installed runner version %q does not match required %q, reinstalling", vm.InstanceName, ver, s.runnerVersion)
+				if err := s.guestRunner.Install(ctx, ip, s.runnerVersion); err != nil {
+					return fmt.Errorf("reinstall runner: %w", err)
+				}
+			}
+		}
+	}
+
+	// Write JIT config to guest and launch.
+	jitPath, err := s.guestRunner.WriteJITConfig(ctx, ip, vm.JITConfig)
+	if err != nil {
+		return fmt.Errorf("write JIT config: %w", err)
+	}
+	if err := s.guestRunner.StartRunner(ctx, ip, jitPath); err != nil {
+		return fmt.Errorf("start runner: %w", err)
+	}
+
+	s.mu.Lock()
+	vm.RunnerLaunched = true
+	vm.RunnerLaunchedAt = time.Now()
+	s.mu.Unlock()
+	s.debug.Printf("scheduler: %s: runner launched inside guest", vm.InstanceName)
+	return nil
+}
+
+// retryJITConfig deletes the stale GitHub runner registration, generates a
+// fresh JIT config, kills the old guest process, and re-launches run.sh.
+// Called when the runner does not come online within runnerOnlineTimeout.
+func (s *Scheduler) retryJITConfig(ctx context.Context, vm *VM) {
+	s.mu.Lock()
+	if vm.RetryCount >= jitRetryMax {
+		s.mu.Unlock()
+		log.Printf("scheduler: %s: exceeded max JIT retries (%d), marking Failed", vm.InstanceName, jitRetryMax)
+		s.mu.Lock()
+		vm.State = Failed
+		s.mu.Unlock()
+		return
+	}
+	vm.RetryCount++
+	retryNum := vm.RetryCount
+	s.mu.Unlock()
+
+	log.Printf("scheduler: %s: JIT config likely expired (retry %d/%d), regenerating", vm.InstanceName, retryNum, jitRetryMax)
+
+	// Clean up the stale GitHub registration.
+	if s.runnerCleaner != nil && vm.Target != nil {
+		if err := s.runnerCleaner.DeleteRunnerByName(ctx, *vm.Target, vm.InstanceName); err != nil {
+			log.Printf("scheduler: %s: failed to delete stale runner registration: %v", vm.InstanceName, err)
+			// Continue anyway; a stale entry is harmless other than clutter.
+		}
+	}
+
+	// Kill the old run.sh process inside the guest.
+	if s.guestRunner != nil && vm.GuestIP != "" {
+		if err := s.guestRunner.KillRunner(ctx, vm.GuestIP); err != nil {
+			log.Printf("scheduler: %s: failed to kill old runner process: %v", vm.InstanceName, err)
+		}
+	}
+
+	// Generate a fresh JIT config.
+	if vm.Target == nil {
+		log.Printf("scheduler: %s: no target assigned, cannot regenerate JIT", vm.InstanceName)
+		s.mu.Lock()
+		vm.State = Failed
+		s.mu.Unlock()
+		return
+	}
+	payload, err := s.registrar.GenerateJITConfig(ctx, *vm.Target, vm.InstanceName)
+	if err != nil {
+		log.Printf("scheduler: %s: failed to regenerate JIT config: %v", vm.InstanceName, err)
 		s.failIfProvisioningTimedOut(vm)
 		return
 	}
 
-	s.debug.Printf("scheduler: %s: confirmed running (tart alive, GitHub online)", vm.InstanceName)
 	s.mu.Lock()
-	vm.State = Running
+	vm.JITConfig = payload.JITConfig
+	vm.RunnerLaunched = false
+	vm.RunnerLaunchedAt = time.Time{}
 	s.mu.Unlock()
+
+	s.debug.Printf("scheduler: %s: fresh JIT config generated, will re-launch on next tick", vm.InstanceName)
+}
+
+// tailRunnerLogs opens an SSH session to stream runner diagnostic logs.
+// It runs until the SSH connection drops (VM shuts down).
+func (s *Scheduler) tailRunnerLogs(vm *VM) {
+	if s.guestRunner == nil || vm.GuestIP == "" {
+		return
+	}
+	reader, err := s.guestRunner.TailLogs(context.Background(), vm.GuestIP)
+	if err != nil {
+		s.debug.Printf("scheduler: %s: failed to start log tail: %v", vm.InstanceName, err)
+		return
+	}
+	defer reader.Close()
+
+	prefix := fmt.Sprintf("[%s] ", vm.InstanceName)
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		fmt.Println(prefix + scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		s.debug.Printf("scheduler: %s: log tail ended: %v", vm.InstanceName, err)
+	}
 }
 
 // failIfProvisioningTimedOut marks vm Failed once provisioningTimeout has
@@ -567,5 +779,10 @@ func (s *Scheduler) drain(ctx context.Context, vm *VM) {
 	vm.Target = nil
 	vm.AssignedAt = time.Time{}
 	vm.GitHubOfflineSince = time.Time{}
+	vm.RetryCount = 0
+	vm.RunnerLaunched = false
+	vm.RunnerLaunchedAt = time.Time{}
+	vm.GuestIP = ""
+	vm.JITConfig = ""
 	s.mu.Unlock()
 }

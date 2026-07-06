@@ -1,4 +1,4 @@
-// Example mac-action-agent config.
+// Example mac-runners-manager config.
 //
 // Host functions available in this file:
 //   env(name)             - read an environment variable
@@ -34,6 +34,20 @@ module.exports = {
 
   // How often to poll GitHub for queued jobs.
   tickIntervalSeconds: 30,
+
+  // Optional: GitHub Actions runner version to install inside VMs.
+  // If omitted (or empty) the agent downloads the latest release automatically.
+  runnerVersion: "2.335.1",
+
+  // Optional: SSH credentials for connecting to VM guests. These can also
+  // be provided via CLI flags (-ssh-user, -ssh-password, -ssh-key).
+  // CLI flags override values provided here.
+  sshCredentials: {
+    user: "admin",
+    // Provide exactly ONE of password or keyPath:
+    password: "admin",
+    // keyPath: "/path/to/id_rsa"
+  },
 
   // Optional, single-target configs only: immediately provision the entire
   // pool for the one target at startup, ignoring queued-job demand. Useful

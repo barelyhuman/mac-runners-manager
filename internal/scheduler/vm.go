@@ -46,4 +46,26 @@ type VM struct {
 	// from a transient status blip before draining it. Zero means "not
 	// currently observed offline."
 	GitHubOfflineSince time.Time
+
+	// RetryCount counts how many times we've regenerated a JIT config
+	// and retried launching the runner inside this VM. Used to bound
+	// provisioning retries before giving up.
+	RetryCount int
+
+	// RunnerLaunched is true once the agent has successfully started
+	// run.sh inside the guest for the current provisioning cycle.
+	RunnerLaunched bool
+
+	// RunnerLaunchedAt records when run.sh was started inside the guest.
+	// Used to decide when a JIT config has likely expired.
+	RunnerLaunchedAt time.Time
+
+	// GuestIP is the resolved IP address of the VM, set once the guest
+	// acquires an address and is reachable over SSH.
+	GuestIP string
+
+	// JITConfig holds the most recently generated base64-encoded JIT config
+	// for this VM. It is written to the guest over SSH when the runner is
+	// launched, and regenerated if it expires before the runner comes online.
+	JITConfig string
 }

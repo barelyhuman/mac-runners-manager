@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/usebruno/mac-action-agent/internal/scheduler"
+	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 )
 
 func TestLoad_ValidConfig(t *testing.T) {
