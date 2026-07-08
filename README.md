@@ -53,6 +53,7 @@ Runtime behavior is controlled by a JS config file (see [configs/example.config.
 - `priority(state)` (optional) — custom weighting function for allocation
 - `forceSpawn` (optional, single-target configs only) — immediately fill the pool for the one target at startup, ignoring queued-job demand; a one-shot action, normal demand-based allocation resumes on later ticks
 - `runnerVersion` (optional) — GitHub Actions runner version tag to install (e.g. `"2.335.1"`); if omitted, the agent downloads the latest release automatically
+- `vmMemoryMB` (optional) — VM memory size in megabytes (e.g. `4096` = 4 GB); zero or omitted means "use the base image's default"
 - `sshCredentials` (optional) — `{ user, password }` or `{ user, keyPath }` for connecting to VM guests; CLI flags (`-ssh-user`, `-ssh-password`, `-ssh-key`) override these values
 
 The config file runs in an embedded JS engine (goja) with host functions `env(name)`, `exec(cmd, ...args)`, and `log(...)`. Treat the config file as trusted code you own, not untrusted input.
@@ -74,6 +75,7 @@ Flags:
 - `-ssh-user` — SSH user for connecting to VM guests (default `admin`)
 - `-ssh-password` — SSH password for VM guests (or set `SSH_DEBUG_PASSWORD`)
 - `-ssh-key` — path to a PEM-encoded private key for VM guest SSH
+- `-vm-memory` — VM memory size in megabytes (e.g. `4096` = 4 GB); overrides `vmMemoryMB` from config. Zero means "use the base image's default"
 - `-verbose` — enable debug logging of demand polling, allocation, and tart CLI calls
 - `-tail-runner-logs` — stream each runner's diagnostic logs to the agent's stdout
 - `-ssh-debug` — instance name of a booted VM to inspect over SSH, then exit (does not run the scheduler)

@@ -47,6 +47,12 @@ type VM struct {
 	// currently observed offline."
 	GitHubOfflineSince time.Time
 
+	// RunnerIdleSince tracks how long GitHub has reported this VM's
+	// runner as online but not busy. Zero means "not currently observed
+	// idle." Used to reclaim VMs whose runner has finished its job but
+	// the VM hypervisor process is still alive.
+	RunnerIdleSince time.Time
+
 	// RetryCount counts how many times we've regenerated a JIT config
 	// and retried launching the runner inside this VM. Used to bound
 	// provisioning retries before giving up.

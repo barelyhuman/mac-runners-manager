@@ -179,6 +179,12 @@ func (f *fakeRunnerStatusChecker) setOnline(runnerName string, online bool) {
 	f.statuses[runnerName] = RunnerStatus{Found: online, Online: online}
 }
 
+func (f *fakeRunnerStatusChecker) setOnlineAndBusy(runnerName string, online, busy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statuses[runnerName] = RunnerStatus{Found: online, Online: online, Busy: busy}
+}
+
 func testScheduler(t *testing.T, poolSize int, targets []TargetRef, ds *fakeDemandSource, prov *fakeProvisioner, reg *fakeRegistrar, opts ...func(*Config)) *Scheduler {
 	t.Helper()
 	cfg := Config{
@@ -879,5 +885,116 @@ func TestReconcileRunning_RecoversFromTransientGitHubOfflineBlip(t *testing.T) {
 	}
 	if !offlineSince.IsZero() {
 		t.Errorf("expected GitHubOfflineSince cleared after recovering online, got %v", offlineSince)
+	}
+}
+
+func TestReconcileRunning_DrainsIdleRunnerAfterGracePeriod(t *testing.T) {
+	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
+	ds := &fakeDemandSource{}
+	ds.setQueued(map[string]int{"acme/repo1": 1}, targets)
+	prov := newFakeProvisioner()
+	reg := &fakeRegistrar{}
+	rs := newFakeRunnerStatusChecker()
+
+	s := testScheduler(t, 1, targets, ds, prov, reg, withRunnerStatus(rs))
+
+	// Tick 1: provisions.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	s.mu.Lock()
+	instanceName := s.vms[0].InstanceName
+	s.mu.Unlock()
+	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
+
+	// Tick 2: resolves IP and launches runner.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+
+	// Tick 3: runner comes online but idle (not busy).
+	rs.setOnlineAndBusy(instanceName, true, false)
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+	s.mu.Lock()
+	state := s.vms[0].State
+	s.mu.Unlock()
+	if state != Running {
+		t.Fatalf("expected Running after Tick 3, got %v", state)
+	}
+
+	// Tick 4: still idle, but not yet past idle grace — should stay Running.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 4: %v", err)
+	}
+	s.mu.Lock()
+	state = s.vms[0].State
+	s.mu.Unlock()
+	if state != Running {
+		t.Fatalf("expected Running within idle grace, got %v", state)
+	}
+
+	// Backdate RunnerIdleSince to simulate elapsed idle time.
+	s.mu.Lock()
+	s.vms[0].RunnerIdleSince = time.Now().Add(-runnerIdleGrace - time.Second)
+	s.mu.Unlock()
+
+	// Tick 5: idle grace exceeded — should drain to Idle.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 5: %v", err)
+	}
+	s.mu.Lock()
+	state = s.vms[0].State
+	s.mu.Unlock()
+	if state != Idle {
+		t.Fatalf("expected VM drained to Idle after idle grace elapsed, got %v", state)
+	}
+}
+
+func TestReconcileRunning_BusyRunnerNeverDrained(t *testing.T) {
+	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
+	ds := &fakeDemandSource{}
+	ds.setQueued(map[string]int{"acme/repo1": 1}, targets)
+	prov := newFakeProvisioner()
+	reg := &fakeRegistrar{}
+	rs := newFakeRunnerStatusChecker()
+
+	s := testScheduler(t, 1, targets, ds, prov, reg, withRunnerStatus(rs))
+
+	// Tick 1: provisions.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 1: %v", err)
+	}
+	s.mu.Lock()
+	instanceName := s.vms[0].InstanceName
+	s.mu.Unlock()
+	ds.setQueued(map[string]int{"acme/repo1": 0}, targets)
+
+	// Tick 2: resolves IP and launches runner.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 2: %v", err)
+	}
+
+	// Tick 3: runner comes online and busy.
+	rs.setOnlineAndBusy(instanceName, true, true)
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 3: %v", err)
+	}
+
+	// Backdate RunnerIdleSince (which should never be set for busy runners).
+	s.mu.Lock()
+	s.vms[0].RunnerIdleSince = time.Now().Add(-runnerIdleGrace - time.Hour)
+	s.mu.Unlock()
+
+	// Tick 4: runner is busy — should NOT drain even if we backdated idle timer.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick 4: %v", err)
+	}
+	s.mu.Lock()
+	state := s.vms[0].State
+	s.mu.Unlock()
+	if state != Running {
+		t.Fatalf("expected VM to stay Running while busy, got %v", state)
 	}
 }

@@ -26,6 +26,12 @@ const (
 	// a healthy runner to be torn down mid-flight.
 	githubOfflineGrace = 1 * time.Minute
 
+	// runnerIdleGrace bounds how long a Running VM may have its runner
+	// reported as online but not busy before it's drained. This reclaims
+	// VMs whose ephemeral runner has self-deregistered but whose Tart
+	// hypervisor process is still alive.
+	runnerIdleGrace = 1 * time.Minute
+
 	// runnerOnlineTimeout is how long we wait after launching run.sh for
 	// GitHub to report the runner online. If this elapses we assume the
 	// JIT config expired and retry with a fresh one.
@@ -525,12 +531,12 @@ func (s *Scheduler) reconcileProvisioning(ctx context.Context, vm *VM) {
 	}
 
 	// Runner is launched. Check if GitHub shows it online.
-	online, err := s.checkRunnerOnline(ctx, vm)
+	status, err := s.checkRunnerStatus(ctx, vm)
 	if err != nil {
 		log.Printf("scheduler: runner status check failed for %s: %v", vm.InstanceName, err)
 		return
 	}
-	if online {
+	if status.Found && status.Online {
 		s.debug.Printf("scheduler: %s: confirmed running (tart alive, GitHub online)", vm.InstanceName)
 		s.mu.Lock()
 		vm.State = Running
@@ -708,19 +714,15 @@ func (s *Scheduler) failIfProvisioningTimedOut(vm *VM) {
 	}
 }
 
-// checkRunnerOnline reports whether GitHub currently shows an online runner
-// for vm. If no RunnerStatusChecker is configured, it degrades to "true"
-// (tart-alive-only behavior), so callers that don't wire one up keep the
-// prior behavior rather than getting stuck forever.
-func (s *Scheduler) checkRunnerOnline(ctx context.Context, vm *VM) (bool, error) {
+// checkRunnerStatus reports what GitHub currently sees for a named
+// self-hosted runner for vm. If no RunnerStatusChecker is configured,
+// it degrades to a "found and online" status so callers that don't
+// wire one up keep the prior behavior rather than getting stuck forever.
+func (s *Scheduler) checkRunnerStatus(ctx context.Context, vm *VM) (RunnerStatus, error) {
 	if s.runnerStatus == nil || vm.Target == nil {
-		return true, nil
+		return RunnerStatus{Found: true, Online: true}, nil
 	}
-	status, err := s.runnerStatus.RunnerStatus(ctx, *vm.Target, vm.InstanceName)
-	if err != nil {
-		return false, err
-	}
-	return status.Found && status.Online, nil
+	return s.runnerStatus.RunnerStatus(ctx, *vm.Target, vm.InstanceName)
 }
 
 func (s *Scheduler) reconcileRunning(ctx context.Context, vm *VM) {
@@ -738,19 +740,55 @@ func (s *Scheduler) reconcileRunning(ctx context.Context, vm *VM) {
 		return
 	}
 
-	online, err := s.checkRunnerOnline(ctx, vm)
+	status, err := s.checkRunnerStatus(ctx, vm)
 	if err != nil {
 		log.Printf("scheduler: runner status check failed for %s: %v", vm.InstanceName, err)
 		return
 	}
-	if online {
+
+	if status.Found && status.Online {
+		// Runner is online on GitHub.
 		if !vm.GitHubOfflineSince.IsZero() {
 			s.debug.Printf("scheduler: %s: runner back online on GitHub", vm.InstanceName)
 			s.mu.Lock()
 			vm.GitHubOfflineSince = time.Time{}
 			s.mu.Unlock()
 		}
+
+		if status.Busy {
+			// Runner is actively working on a job — clear any idle timer.
+			if !vm.RunnerIdleSince.IsZero() {
+				s.mu.Lock()
+				vm.RunnerIdleSince = time.Time{}
+				s.mu.Unlock()
+			}
+			return
+		}
+
+		// Runner is online but idle. Start or continue the idle timer.
+		s.mu.Lock()
+		if vm.RunnerIdleSince.IsZero() {
+			vm.RunnerIdleSince = time.Now()
+		}
+		idleFor := time.Since(vm.RunnerIdleSince)
+		s.mu.Unlock()
+
+		s.debug.Printf("scheduler: %s: tart alive, runner online but idle (%s)", vm.InstanceName, idleFor)
+		if idleFor > runnerIdleGrace {
+			log.Printf("scheduler: %s runner idle on GitHub for over %s, draining", vm.InstanceName, runnerIdleGrace)
+			s.mu.Lock()
+			vm.State = Draining
+			s.mu.Unlock()
+			s.drain(ctx, vm)
+		}
 		return
+	}
+
+	// Runner is offline or missing on GitHub.
+	if !vm.RunnerIdleSince.IsZero() {
+		s.mu.Lock()
+		vm.RunnerIdleSince = time.Time{}
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()
@@ -791,6 +829,7 @@ func (s *Scheduler) drain(ctx context.Context, vm *VM) {
 	vm.Target = nil
 	vm.AssignedAt = time.Time{}
 	vm.GitHubOfflineSince = time.Time{}
+	vm.RunnerIdleSince = time.Time{}
 	vm.RetryCount = 0
 	vm.RunnerLaunched = false
 	vm.RunnerLaunchedAt = time.Time{}
