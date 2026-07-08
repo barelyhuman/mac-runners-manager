@@ -102,19 +102,19 @@ func (p *PollingDemandSource) countQueuedJobs(ctx context.Context, client *gh.Cl
 	return count, nil
 }
 
-// labelsMatch reports whether every label the target expects is present on
-// the job (job.Labels comes from the workflow's `runs-on:` key). An empty
-// expected label set matches any job.
+// labelsMatch reports whether every label present on the job is contained in
+// the target's expected label set (i.e., the job's labels are a subset of
+// expected). An empty expected label set matches any job.
 func labelsMatch(expected, actual []string) bool {
 	if len(expected) == 0 {
 		return true
 	}
-	actualSet := make(map[string]bool, len(actual))
-	for _, l := range actual {
-		actualSet[l] = true
+	expectedSet := make(map[string]bool, len(expected))
+	for _, l := range expected {
+		expectedSet[l] = true
 	}
-	for _, want := range expected {
-		if !actualSet[want] {
+	for _, l := range actual {
+		if !expectedSet[l] {
 			return false
 		}
 	}

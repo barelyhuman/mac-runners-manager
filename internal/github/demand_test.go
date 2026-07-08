@@ -132,7 +132,7 @@ func TestLabelsMatch(t *testing.T) {
 	}{
 		{"empty expected matches anything", nil, []string{"self-hosted"}, true},
 		{"exact match", []string{"self-hosted", "macOS"}, []string{"self-hosted", "macOS"}, true},
-		{"subset match", []string{"self-hosted"}, []string{"self-hosted", "macOS", "ARM64"}, true},
+		{"job labels are subset of expected", []string{"self-hosted", "macOS", "ARM64"}, []string{"self-hosted", "macOS"}, true},
 		{"missing label fails", []string{"self-hosted", "linux"}, []string{"self-hosted", "macOS"}, false},
 	}
 	for _, tt := range tests {
