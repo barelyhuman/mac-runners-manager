@@ -49,6 +49,11 @@ module.exports = {
     // keyPath: "/path/to/id_rsa"
   },
 
+  // Optional: VM memory size in megabytes. Overrides the base image's
+  // default memory allocation for every cloned VM. Zero or omitted means
+  // "use the base image's default".
+  vmMemoryMB: 4096,
+
   // Optional, single-target configs only: immediately provision the entire
   // pool for the one target at startup, ignoring queued-job demand. Useful
   // when GitHub's queued-job signal is slow/unreliable and you'd rather

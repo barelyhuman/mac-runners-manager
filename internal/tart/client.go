@@ -86,6 +86,12 @@ func (c *Client) Clone(ctx context.Context, baseImage, instanceName string) erro
 	return err
 }
 
+// SetMemory sets the VM memory size in megabytes.
+func (c *Client) SetMemory(ctx context.Context, instanceName string, memoryMB int) error {
+	_, err := c.tart(ctx, "set", instanceName, "--memory", fmt.Sprintf("%d", memoryMB))
+	return err
+}
+
 // bootArgs builds the `tart run` argument list for booting instanceName,
 // applying bridged networking if configured.
 func (c *Client) bootArgs(instanceName string) []string {

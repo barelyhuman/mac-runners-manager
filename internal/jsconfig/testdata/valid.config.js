@@ -8,6 +8,7 @@ module.exports = {
   ],
   poolSize: 3,
   tickIntervalSeconds: 45,
+  vmMemoryMB: 8192,
   priority: function(state) {
     var weights = {};
     state.targets.forEach(function(t) {

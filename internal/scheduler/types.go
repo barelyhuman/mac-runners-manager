@@ -44,6 +44,7 @@ type BootPayload struct {
 // VMProvisioner is the Tart control-plane abstraction.
 type VMProvisioner interface {
 	Clone(ctx context.Context, baseImage, instanceName string) error
+	SetMemory(ctx context.Context, instanceName string, memoryMB int) error
 	Boot(ctx context.Context, instanceName string, payload BootPayload) error
 	IsRunning(ctx context.Context, instanceName string) (bool, error)
 	Stop(ctx context.Context, instanceName string) error

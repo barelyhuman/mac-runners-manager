@@ -51,6 +51,7 @@ func main() {
 	sshKeyPath := flag.String("ssh-key", "", "path to a PEM-encoded private key for VM guest SSH")
 	sshWaitSeconds := flag.Int("ssh-wait", 30, "seconds to wait for -ssh-debug's target VM to report an IP")
 	tailRunnerLogs := flag.Bool("tail-runner-logs", false, "stream each runner's diagnostic logs to the agent's stdout")
+	vmMemory := flag.Int("vm-memory", 0, "VM memory size in megabytes (e.g. 4096 = 4GB). Zero leaves the base image's default.")
 
 	var diagCmds stringList
 	flag.Var(&diagCmds, "diag-cmd", "diagnostic command to run over SSH for -ssh-debug (repeatable; defaults to a built-in set if omitted)")
@@ -110,6 +111,7 @@ func main() {
 		RunnerVersion: cfg.RunnerVersion,
 		Debug:         debugLog,
 		ForceSpawn:    cfg.ForceSpawn,
+		VMMemoryMB:    resolveVMMemory(*vmMemory, cfg.VMMemoryMB),
 		TailLogs:      *tailRunnerLogs,
 	})
 
@@ -123,6 +125,15 @@ func main() {
 		log.Fatalf("mac-runners-manager: scheduler exited with error: %v", err)
 	}
 	log.Println("mac-runners-manager: shutting down")
+}
+
+// resolveVMMemory merges CLI flag with JS config value. CLI flag takes
+// precedence when explicitly set (non-zero).
+func resolveVMMemory(cliMB, cfgMB int) int {
+	if cliMB > 0 {
+		return cliMB
+	}
+	return cfgMB
 }
 
 // resolveSSHCredentials merges CLI flag values with JS config values. CLI

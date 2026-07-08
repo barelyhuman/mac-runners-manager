@@ -37,18 +37,20 @@ func (f *fakeDemandSource) setQueued(counts map[string]int, targets []TargetRef)
 // responses per instance name to simulate boot confirmation and job
 // completion.
 type fakeProvisioner struct {
-	mu       sync.Mutex
-	cloned   []string
-	booted   []string
-	stopped  []string
-	deleted  []string
-	running  map[string]bool
-	cloneErr error
-	bootErr  error
+	mu         sync.Mutex
+	cloned     []string
+	memorySet  map[string]int
+	booted     []string
+	stopped    []string
+	deleted    []string
+	running    map[string]bool
+	cloneErr   error
+	bootErr    error
+	memoryErr  error
 }
 
 func newFakeProvisioner() *fakeProvisioner {
-	return &fakeProvisioner{running: map[string]bool{}}
+	return &fakeProvisioner{running: map[string]bool{}, memorySet: map[string]int{}}
 }
 
 func (f *fakeProvisioner) Clone(ctx context.Context, baseImage, instanceName string) error {
@@ -58,6 +60,16 @@ func (f *fakeProvisioner) Clone(ctx context.Context, baseImage, instanceName str
 		return f.cloneErr
 	}
 	f.cloned = append(f.cloned, instanceName)
+	return nil
+}
+
+func (f *fakeProvisioner) SetMemory(ctx context.Context, instanceName string, memoryMB int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.memoryErr != nil {
+		return f.memoryErr
+	}
+	f.memorySet[instanceName] = memoryMB
 	return nil
 }
 
@@ -558,6 +570,48 @@ func TestBuildInstanceName_TruncatesVeryLongRepoNames(t *testing.T) {
 	}
 	if !strings.HasSuffix(name, "-abc123") {
 		t.Errorf("expected id suffix preserved even when key is truncated, got %q", name)
+	}
+}
+
+func TestTick_ProvisioningSetsVMMemoryWhenConfigured(t *testing.T) {
+	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
+	ds := &fakeDemandSource{}
+	ds.setQueued(map[string]int{"acme/repo1": 1}, targets)
+	prov := newFakeProvisioner()
+	reg := &fakeRegistrar{}
+
+	s := testScheduler(t, 1, targets, ds, prov, reg, func(c *Config) {
+		c.VMMemoryMB = 4096
+	})
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if len(prov.cloned) != 1 {
+		t.Fatalf("expected 1 VM cloned, got %d", len(prov.cloned))
+	}
+	instanceName := prov.cloned[0]
+	if prov.memorySet[instanceName] != 4096 {
+		t.Errorf("expected SetMemory(4096) for %s, got %v", instanceName, prov.memorySet)
+	}
+}
+
+func TestTick_ProvisioningSkipsSetVMMemoryWhenZero(t *testing.T) {
+	targets := []TargetRef{{Owner: "acme", Repo: "repo1"}}
+	ds := &fakeDemandSource{}
+	ds.setQueued(map[string]int{"acme/repo1": 1}, targets)
+	prov := newFakeProvisioner()
+	reg := &fakeRegistrar{}
+
+	s := testScheduler(t, 1, targets, ds, prov, reg)
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if len(prov.memorySet) != 0 {
+		t.Errorf("expected no SetMemory calls when VMMemoryMB=0, 		got %v", prov.memorySet)
 	}
 }
 

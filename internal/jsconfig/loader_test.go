@@ -29,6 +29,9 @@ func TestLoad_ValidConfig(t *testing.T) {
 	if cfg.TickInterval.Seconds() != 45 {
 		t.Errorf("TickInterval = %v, want 45s", cfg.TickInterval)
 	}
+	if cfg.VMMemoryMB != 8192 {
+		t.Errorf("VMMemoryMB = %d, want 8192", cfg.VMMemoryMB)
+	}
 
 	os.Setenv("TEST_PAT", "abc123")
 	defer os.Unsetenv("TEST_PAT")

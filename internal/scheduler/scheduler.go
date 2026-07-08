@@ -61,6 +61,7 @@ type Scheduler struct {
 	debug         *log.Logger
 	forceSpawn    bool
 	runnerVersion string
+	vmMemoryMB    int
 	tailLogs      bool
 
 	mu  sync.Mutex
@@ -89,6 +90,9 @@ type Config struct {
 	// entire idle pool with runners for that target once at startup,
 	// bypassing queued-job demand entirely. Ignored with multiple targets.
 	ForceSpawn bool
+	// VMMemoryMB sets the memory size of each cloned VM in megabytes.
+	// Zero means "leave the base image's default".
+	VMMemoryMB int
 	// TailLogs starts a background goroutine per Running VM that streams
 	// the runner diagnostic logs back to the agent's stdout.
 	TailLogs bool
@@ -123,6 +127,7 @@ func New(cfg Config) *Scheduler {
 		debug:         debug,
 		forceSpawn:    cfg.ForceSpawn,
 		runnerVersion: cfg.RunnerVersion,
+		vmMemoryMB:    cfg.VMMemoryMB,
 		tailLogs:      cfg.TailLogs,
 	}
 }
@@ -434,6 +439,13 @@ func (s *Scheduler) provision(ctx context.Context, vm *VM, target TargetRef) err
 	s.debug.Printf("scheduler: %s: cloning from base image %s", instanceName, s.baseImage)
 	if err := s.provisioner.Clone(ctx, s.baseImage, instanceName); err != nil {
 		return fmt.Errorf("clone VM: %w", err)
+	}
+
+	if s.vmMemoryMB > 0 {
+		s.debug.Printf("scheduler: %s: setting memory to %d MB", instanceName, s.vmMemoryMB)
+		if err := s.provisioner.SetMemory(ctx, instanceName, s.vmMemoryMB); err != nil {
+			return fmt.Errorf("set VM memory: %w", err)
+		}
 	}
 
 	s.debug.Printf("scheduler: %s: booting", instanceName)

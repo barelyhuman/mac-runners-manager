@@ -100,6 +100,21 @@ func TestDelete_BuildsExpectedArgs(t *testing.T) {
 	}
 }
 
+func TestSetMemory_BuildsExpectedArgs(t *testing.T) {
+	c, calls := newFakeClient(t, nil)
+	if err := c.SetMemory(context.Background(), "instance-1", 8192); err != nil {
+		t.Fatalf("SetMemory: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(*calls))
+	}
+	got := (*calls)[0]
+	want := []string{"set", "instance-1", "--memory", "8192"}
+	if !equalArgs(got.args, want) {
+		t.Errorf("SetMemory args = %v, want %v", got.args, want)
+	}
+}
+
 func TestList_ParsesRunningInstancesOnly(t *testing.T) {
 	entries := []tartListEntry{
 		{Name: "instance-1", Running: true},
