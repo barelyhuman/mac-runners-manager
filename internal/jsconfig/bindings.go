@@ -7,12 +7,37 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dop251/goja"
 )
 
-const execTimeout = 5 * time.Second
+const defaultExecTimeout = 60 * time.Second
+
+var (
+	execTimeoutMu sync.RWMutex
+	execTimeout   = defaultExecTimeout
+)
+
+// setExecTimeout updates the timeout used by the host exec() function.
+// A value of zero resets to the defaultExecTimeout.
+func setExecTimeout(seconds int) {
+	execTimeoutMu.Lock()
+	defer execTimeoutMu.Unlock()
+	if seconds > 0 {
+		execTimeout = time.Duration(seconds) * time.Second
+	} else {
+		execTimeout = defaultExecTimeout
+	}
+}
+
+// getExecTimeout returns the current timeout for the host exec() function.
+func getExecTimeout() time.Duration {
+	execTimeoutMu.RLock()
+	defer execTimeoutMu.RUnlock()
+	return execTimeout
+}
 
 // registerHostFunctions exposes the small set of globals the config script
 // may call: env() for reading environment variables, exec() for shelling out
@@ -31,7 +56,8 @@ func hostEnv(name string) string {
 }
 
 func hostExec(cmd string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
+	timeout := getExecTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	c := exec.CommandContext(ctx, cmd, args...)

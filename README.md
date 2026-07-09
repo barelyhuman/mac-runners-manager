@@ -54,6 +54,7 @@ Runtime behavior is controlled by a JS config file (see [configs/example.config.
 - `forceSpawn` (optional, single-target configs only) — immediately fill the pool for the one target at startup, ignoring queued-job demand; a one-shot action, normal demand-based allocation resumes on later ticks
 - `runnerVersion` (optional) — GitHub Actions runner version tag to install (e.g. `"2.335.1"`); if omitted, the agent downloads the latest release automatically
 - `vmMemoryMB` (optional) — VM memory size in megabytes (e.g. `4096` = 4 GB); zero or omitted means "use the base image's default"
+- `execTimeoutSeconds` (optional) — timeout in seconds for `exec()` calls from the config (e.g. when shelling out to 1Password CLI or macOS Keychain). Default is `60`; increase it for slow-responding commands like `security find-generic-password`
 - `sshCredentials` (optional) — `{ user, password }` or `{ user, keyPath }` for connecting to VM guests; CLI flags (`-ssh-user`, `-ssh-password`, `-ssh-key`) override these values
 
 The config file runs in an embedded JS engine (goja) with host functions `env(name)`, `exec(cmd, ...args)`, and `log(...)`. Treat the config file as trusted code you own, not untrusted input.

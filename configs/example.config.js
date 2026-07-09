@@ -54,6 +54,11 @@ module.exports = {
   // "use the base image's default".
   vmMemoryMB: 4096,
 
+  // Optional: timeout for exec() calls from the config (e.g. when shelling
+  // out to a secrets manager or keychain CLI). Default is 60 seconds.
+  // Increase this for slow-responding commands like macOS `security`.
+  execTimeoutSeconds: 60,
+
   // Optional, single-target configs only: immediately provision the entire
   // pool for the one target at startup, ignoring queued-job demand. Useful
   // when GitHub's queued-job signal is slow/unreliable and you'd rather

@@ -22,15 +22,16 @@ const (
 
 // ResolvedConfig is the fully-decoded result of loading a config.js file.
 type ResolvedConfig struct {
-	Auth           func(ctx context.Context) (string, error)
-	Priority       scheduler.PriorityFunc
-	Targets        []scheduler.TargetRef
-	PoolSize       int
-	TickInterval   time.Duration
-	ForceSpawn     bool
-	RunnerVersion  string         // optional: GitHub Actions runner version tag, e.g. "2.335.1"
-	VMMemoryMB     int            // optional: VM memory size in MB (e.g. 4096 = 4GB)
-	SSHCredentials SSHCredentials // optional: overrides CLI flags if set
+	Auth             func(ctx context.Context) (string, error)
+	Priority         scheduler.PriorityFunc
+	Targets          []scheduler.TargetRef
+	PoolSize         int
+	TickInterval     time.Duration
+	ForceSpawn       bool
+	RunnerVersion    string         // optional: GitHub Actions runner version tag, e.g. "2.335.1"
+	VMMemoryMB       int            // optional: VM memory size in MB (e.g. 4096 = 4GB)
+	SSHCredentials   SSHCredentials // optional: overrides CLI flags if set
+	ExecTimeoutSec   int            // optional: override default exec timeout in seconds
 }
 
 // SSHCredentials describes how the agent should authenticate to VM guests
@@ -133,6 +134,11 @@ func Load(path string) (*ResolvedConfig, error) {
 		vmMemoryMB = int(v.ToInteger())
 	}
 
+	execTimeoutSec := 0
+	if v := exportsObj.Get("execTimeoutSeconds"); v != nil && !goja.IsUndefined(v) {
+		execTimeoutSec = int(v.ToInteger())
+	}
+
 	sshCreds := SSHCredentials{}
 	if v := exportsObj.Get("sshCredentials"); v != nil && !goja.IsUndefined(v) {
 		if m, ok := v.Export().(map[string]interface{}); ok {
@@ -148,6 +154,8 @@ func Load(path string) (*ResolvedConfig, error) {
 		}
 	}
 
+	setExecTimeout(execTimeoutSec)
+
 	rc := &ResolvedConfig{
 		Auth:          jc.Auth,
 		Targets:       targets,
@@ -157,6 +165,7 @@ func Load(path string) (*ResolvedConfig, error) {
 		RunnerVersion: runnerVersion,
 		VMMemoryMB:    vmMemoryMB,
 		SSHCredentials: sshCreds,
+		ExecTimeoutSec: execTimeoutSec,
 	}
 	if jc.priority != nil {
 		rc.Priority = jc.Priority
