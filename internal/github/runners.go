@@ -57,9 +57,10 @@ func (c *RunnerStatusChecker) RunnerStatus(ctx context.Context, target scheduler
 			continue
 		}
 		status := scheduler.RunnerStatus{
-			Found:  true,
-			Online: r.GetStatus() == "online",
-			Busy:   r.GetBusy(),
+			Found:    true,
+			Online:   r.GetStatus() == "online",
+			Busy:     r.GetBusy(),
+			RunnerID: r.GetID(),
 		}
 		c.debug.Printf("github: %s: runner %q status=%s busy=%v", target.Key(), runnerName, r.GetStatus(), r.GetBusy())
 		return status, nil

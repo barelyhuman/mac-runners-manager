@@ -139,6 +139,7 @@ func (f *fakeGuestProvisioner) WriteJITConfig(ctx context.Context, ip, jitConfig
 }
 func (f *fakeGuestProvisioner) StartRunner(ctx context.Context, ip, jitConfigPath string) error { return nil }
 func (f *fakeGuestProvisioner) KillRunner(ctx context.Context, ip string) error               { return nil }
+func (f *fakeGuestProvisioner) RemoveRunner(ctx context.Context, ip string) error              { return nil }
 func (f *fakeGuestProvisioner) TailLogs(ctx context.Context, ip string) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }

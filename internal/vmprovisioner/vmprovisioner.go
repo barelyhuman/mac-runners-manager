@@ -164,6 +164,19 @@ func (g *GuestProvisioner) KillRunner(ctx context.Context, ip string) error {
 	return nil
 }
 
+// RemoveRunner force-stops any running runner process and removes its
+// configuration files from the guest so the VM can be reprovisioned.
+// Used as a fallback when the GitHub API deletion path is unavailable.
+func (g *GuestProvisioner) RemoveRunner(ctx context.Context, ip string) error {
+	g.debug.Printf("vmprovisioner: removing runner on %s", ip)
+	cmds := []string{
+		"pkill -f 'run.sh' || true",
+		fmt.Sprintf("rm -f %s/.runner %s/.credentials %s/.credentials_rsaparams %s/%s", g.install, g.install, g.install, g.install, jitConfigFile),
+	}
+	_, err := g.ssh.Run(ip, cmds)
+	return err
+}
+
 // TailLogs returns a ReadCloser that streams the runner diagnostic logs.
 // The caller must Close() the returned reader when done.
 func (g *GuestProvisioner) TailLogs(ctx context.Context, ip string) (io.ReadCloser, error) {

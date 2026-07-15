@@ -73,6 +73,9 @@ type GuestRunnerProvisioner interface {
 	StartRunner(ctx context.Context, ip, jitConfigPath string) error
 	// KillRunner terminates any existing run.sh process in the guest.
 	KillRunner(ctx context.Context, ip string) error
+	// RemoveRunner force-stops the runner and deletes its config files.
+	// Used as a fallback when the GitHub API path is unavailable.
+	RemoveRunner(ctx context.Context, ip string) error
 	// TailLogs returns a ReadCloser streaming the runner diag logs.
 	// The caller is responsible for closing it.
 	TailLogs(ctx context.Context, ip string) (io.ReadCloser, error)
@@ -93,9 +96,10 @@ type RunnerRegistrar interface {
 // runner. Found is false if no runner with that name is registered yet
 // (e.g. the guest hasn't read its jitconfig and registered at all).
 type RunnerStatus struct {
-	Found  bool
-	Online bool
-	Busy   bool
+	Found    bool
+	Online   bool
+	Busy     bool
+	RunnerID int64 // cached once discovered via the list-runners API
 }
 
 // RunnerStatusChecker bridges GitHub's list-runners API to the scheduler,

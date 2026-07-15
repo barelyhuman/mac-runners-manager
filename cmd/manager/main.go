@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/barelyhuman/mac-runners-manager/internal/jsconfig"
 	"github.com/barelyhuman/mac-runners-manager/internal/scheduler"
 	"github.com/barelyhuman/mac-runners-manager/internal/sshdebug"
+	"github.com/barelyhuman/mac-runners-manager/internal/store"
 	"github.com/barelyhuman/mac-runners-manager/internal/tart"
 	"github.com/barelyhuman/mac-runners-manager/internal/vmprovisioner"
 )
@@ -52,6 +54,8 @@ func main() {
 	sshWaitSeconds := flag.Int("ssh-wait", 30, "seconds to wait for -ssh-debug's target VM to report an IP")
 	tailRunnerLogs := flag.Bool("tail-runner-logs", false, "stream each runner's diagnostic logs to the agent's stdout")
 	vmMemory := flag.Int("vm-memory", 0, "VM memory size in megabytes (e.g. 4096 = 4GB). Zero leaves the base image's default.")
+	dbPath := flag.String("db", "", "path to SQLite database (default: <state-dir>/runners.db)")
+	showDB := flag.Bool("show-db", false, "print active runners from the database and exit (does not start the scheduler)")
 
 	var diagCmds stringList
 	flag.Var(&diagCmds, "diag-cmd", "diagnostic command to run over SSH for -ssh-debug (repeatable; defaults to a built-in set if omitted)")
@@ -77,9 +81,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("mac-runners-manager: failed to load config: %v", err)
 	}
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("mac-runners-manager: config validation failed: %v", err)
+	}
 
 	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
 		log.Fatalf("mac-runners-manager: failed to create state dir: %v", err)
+	}
+
+	dbFile := *dbPath
+	if dbFile == "" {
+		dbFile = filepath.Join(*stateDir, "runners.db")
+	}
+	storeDB, err := store.Open(dbFile)
+	if err != nil {
+		log.Fatalf("mac-runners-manager: failed to open DB: %v", err)
+	}
+	defer storeDB.Close()
+
+	if *showDB {
+		if err := printStoreStatus(storeDB); err != nil {
+			log.Fatalf("mac-runners-manager: failed to show DB status: %v", err)
+		}
+		return
 	}
 
 	// Resolve SSH credentials: CLI flags override JS config values.
@@ -113,6 +137,7 @@ func main() {
 		ForceSpawn:    cfg.ForceSpawn,
 		VMMemoryMB:    resolveVMMemory(*vmMemory, cfg.VMMemoryMB),
 		TailLogs:      *tailRunnerLogs,
+		Store:         storeDB,
 	})
 
 	log.Printf("mac-runners-manager: starting with pool size %d, tick interval %s, %d target(s), runner version %q",
@@ -177,6 +202,41 @@ func buildSSHClient(creds sshdebug.Config) (*sshdebug.Client, error) {
 	return sshdebug.New(creds)
 }
 
+// validateConfig eagerly exercises the dynamic parts of the config (auth,
+// priority) so startup fails fast instead of waiting for the first tick.
+func validateConfig(cfg *jsconfig.ResolvedConfig) error {
+	ctx := context.Background()
+	pat, err := cfg.Auth(ctx)
+	if err != nil {
+		return fmt.Errorf("auth() failed: %w", err)
+	}
+	if pat == "" {
+		return fmt.Errorf("auth() returned an empty PAT")
+	}
+	if cfg.Priority != nil {
+		dummyState := scheduler.SchedulerState{
+			FreeVMCount: cfg.PoolSize,
+		}
+		for _, t := range cfg.Targets {
+			dummyState.Targets = append(dummyState.Targets, scheduler.TargetDemand{
+				Owner:      t.Owner,
+				Repo:       t.Repo,
+				QueuedJobs: 0,
+			})
+		}
+		weights, err := cfg.Priority(dummyState)
+		if err != nil {
+			return fmt.Errorf("priority() failed: %w", err)
+		}
+		for key := range weights {
+			if weights[key] < 0 {
+				return fmt.Errorf("priority() returned negative weight for %q", key)
+			}
+		}
+	}
+	return nil
+}
+
 // runSSHDebug resolves the named VM's IP via `tart ip`, connects over SSH,
 // and runs a set of read-only diagnostic commands, printing output for each.
 // One-shot: it does not start the scheduler.
@@ -233,6 +293,28 @@ func runSSHDebug(tartBinary, netBridged, instanceName, user, password, keyPath s
 			fmt.Printf("(command error: %v)\n", r.Err)
 		}
 		fmt.Println(r.Output)
+	}
+	return nil
+}
+
+// printStoreStatus prints every active runner in the store and exits.
+func printStoreStatus(db *store.Store) error {
+	active, err := db.ListActive()
+	if err != nil {
+		return fmt.Errorf("list active: %w", err)
+	}
+	if len(active) == 0 {
+		fmt.Println("No active runners in database.")
+		return nil
+	}
+	fmt.Printf("%-40s %-12s %-25s %-20s %s\n", "INSTANCE", "STATE", "TARGET", "GUEST_IP", "SINCE")
+	for _, r := range active {
+		ip := r.GuestIPString()
+		if ip == "" {
+			ip = "-"
+		}
+		age := time.Since(r.CreatedAt).Round(time.Second)
+		fmt.Printf("%-40s %-12s %-25s %-20s %s\n", r.InstanceName, r.State, r.TargetOwner+"/"+r.TargetRepo, ip, age)
 	}
 	return nil
 }

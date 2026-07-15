@@ -3,6 +3,7 @@ package scheduler
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/barelyhuman/mac-runners-manager/internal/store"
 )
 
 const (
@@ -64,6 +67,7 @@ type Scheduler struct {
 	baseImage     string
 	tickEvery     time.Duration
 	genID         idGenerator
+	store         *store.Store
 	debug         *log.Logger
 	forceSpawn    bool
 	runnerVersion string
@@ -102,6 +106,9 @@ type Config struct {
 	// TailLogs starts a background goroutine per Running VM that streams
 	// the runner diagnostic logs back to the agent's stdout.
 	TailLogs bool
+	// Store persists runner state across restarts. If nil, the scheduler
+	// falls back to purely in-memory management without orphan recovery.
+	Store *store.Store
 }
 
 // New constructs a Scheduler with a fixed-size pool of idle VM slots.
@@ -130,6 +137,7 @@ func New(cfg Config) *Scheduler {
 		tickEvery:     cfg.TickEvery,
 		vms:           vms,
 		genID:         defaultIDGenerator,
+		store:         cfg.Store,
 		debug:         debug,
 		forceSpawn:    cfg.ForceSpawn,
 		runnerVersion: cfg.RunnerVersion,
@@ -156,6 +164,9 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	ticker := time.NewTicker(s.tickEvery)
 	defer ticker.Stop()
 
+	cleanupTicker := time.NewTicker(2 * time.Minute)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -164,6 +175,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ticker.C:
 			if err := s.Tick(ctx); err != nil {
 				log.Printf("scheduler: tick error: %v", err)
+			}
+		case <-cleanupTicker.C:
+			if err := s.cleanup(ctx); err != nil {
+				log.Printf("scheduler: cleanup error: %v", err)
 			}
 		}
 	}
@@ -188,8 +203,11 @@ func (s *Scheduler) shutdown() {
 	}
 }
 
-// ReconcileOnStartup checks for orphan VMs from a previous run and warns
-// the user to stop and delete them manually rather than adopting them.
+// ReconcileOnStartup checks for orphan VMs from a previous run.  If a store
+// is configured, it cross-references the DB with the live Tart VMs and
+// cleans up any runner whose VM is gone but whose GitHub registration
+// remains.  Live VMs from a previous run are left alone to finish and
+// self-deregister.
 func (s *Scheduler) ReconcileOnStartup(ctx context.Context) {
 	names, err := s.provisioner.List(ctx)
 	if err != nil {
@@ -197,14 +215,52 @@ func (s *Scheduler) ReconcileOnStartup(ctx context.Context) {
 		return
 	}
 
-	var orphans []string
-	for _, name := range names {
-		if strings.HasPrefix(name, instanceNamePrefix) {
-			orphans = append(orphans, name)
+	tartSet := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		tartSet[n] = struct{}{}
+	}
+
+	if s.store != nil {
+		active, err := s.store.ListActive()
+		if err != nil {
+			log.Printf("scheduler: startup: failed to list active DB entries: %v", err)
+		} else {
+			for _, r := range active {
+				if _, ok := tartSet[r.InstanceName]; ok {
+					log.Printf("scheduler: startup: found live VM %s from previous run (will finish and self-deregister)", r.InstanceName)
+					continue
+				}
+				log.Printf("scheduler: startup: orphan runner %s (VM gone), cleaning up GitHub registration", r.InstanceName)
+				s.cleanupRunner(ctx, r)
+			}
 		}
 	}
-	if len(orphans) > 0 {
-		log.Printf("scheduler: WARNING: found %d orphan VM(s) from a previous run: %v", len(orphans), orphans)
+
+	// Warn about Tart VMs that aren't tracked in the DB at all.
+	var unmanaged []string
+	if s.store != nil {
+		active, _ := s.store.ListActive()
+		activeSet := make(map[string]struct{}, len(active))
+		for _, r := range active {
+			activeSet[r.InstanceName] = struct{}{}
+		}
+		for _, n := range names {
+			if strings.HasPrefix(n, instanceNamePrefix) {
+				if _, ok := activeSet[n]; !ok {
+					unmanaged = append(unmanaged, n)
+				}
+			}
+		}
+	} else {
+		for _, n := range names {
+			if strings.HasPrefix(n, instanceNamePrefix) {
+				unmanaged = append(unmanaged, n)
+			}
+		}
+	}
+
+	if len(unmanaged) > 0 {
+		log.Printf("scheduler: WARNING: found %d unmanaged orphan VM(s): %v", len(unmanaged), unmanaged)
 		log.Printf("scheduler: please stop and delete these VMs manually, then restart the agent")
 	}
 }
@@ -442,6 +498,24 @@ func (s *Scheduler) provision(ctx context.Context, vm *VM, target TargetRef) err
 		return fmt.Errorf("generate JIT config: %w", err)
 	}
 
+	if s.store != nil {
+		labelsJSON := ""
+		if len(target.Labels) > 0 {
+			b, _ := json.Marshal(target.Labels)
+			labelsJSON = string(b)
+		}
+		if err := s.store.InsertRunner(store.Runner{
+			InstanceName: instanceName,
+			TargetOwner:  target.Owner,
+			TargetRepo:   target.Repo,
+			State:        "provisioning",
+			JITConfig:    payload.JITConfig,
+			Labels:       store.NullString(labelsJSON),
+		}); err != nil {
+			log.Printf("scheduler: failed to insert runner %s into DB: %v", instanceName, err)
+		}
+	}
+
 	s.debug.Printf("scheduler: %s: cloning from base image %s", instanceName, s.baseImage)
 	if err := s.provisioner.Clone(ctx, s.baseImage, instanceName); err != nil {
 		return fmt.Errorf("clone VM: %w", err)
@@ -541,6 +615,12 @@ func (s *Scheduler) reconcileProvisioning(ctx context.Context, vm *VM) {
 		s.mu.Lock()
 		vm.State = Running
 		s.mu.Unlock()
+		if s.store != nil {
+			if status.RunnerID > 0 {
+				_ = s.store.UpdateGitHubRunnerID(vm.InstanceName, status.RunnerID)
+			}
+			_ = s.store.UpdateState(vm.InstanceName, "running")
+		}
 		if s.tailLogs && s.guestRunner != nil {
 			go s.tailRunnerLogs(vm)
 		}
@@ -562,6 +642,9 @@ func (s *Scheduler) resolveGuestIP(ctx context.Context, vm *VM) (string, error) 
 	ip, err := s.provisioner.IP(ctx, vm.InstanceName, 60)
 	if err != nil {
 		return "", fmt.Errorf("resolve IP: %w", err)
+	}
+	if s.store != nil {
+		_ = s.store.UpdateGuestIP(vm.InstanceName, ip)
 	}
 	return ip, nil
 }
@@ -675,6 +758,11 @@ func (s *Scheduler) retryJITConfig(ctx context.Context, vm *VM) {
 	vm.RunnerLaunched = false
 	vm.RunnerLaunchedAt = time.Time{}
 	s.mu.Unlock()
+
+	if s.store != nil {
+		_ = s.store.UpdateJITConfig(vm.InstanceName, payload.JITConfig)
+		_ = s.store.UpdateState(vm.InstanceName, "provisioning")
+	}
 
 	s.debug.Printf("scheduler: %s: fresh JIT config generated, will re-launch on next tick", vm.InstanceName)
 }
@@ -821,6 +909,11 @@ func (s *Scheduler) drain(ctx context.Context, vm *VM) {
 		if err := s.provisioner.Delete(ctx, vm.InstanceName); err != nil {
 			log.Printf("scheduler: delete %s failed: %v", vm.InstanceName, err)
 		}
+		if s.store != nil {
+			if err := s.store.SoftDelete(vm.InstanceName); err != nil {
+				log.Printf("scheduler: soft delete %s from DB failed: %v", vm.InstanceName, err)
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -836,4 +929,94 @@ func (s *Scheduler) drain(ctx context.Context, vm *VM) {
 	vm.GuestIP = ""
 	vm.JITConfig = ""
 	s.mu.Unlock()
+}
+
+// updatedAt returns the most recent timestamp for a runner row: updated_at
+// takes precedence over created_at, which is used when updated_at is zero.
+func updatedAt(r store.Runner) time.Time {
+	if r.UpdatedAt.IsZero() {
+		return r.CreatedAt
+	}
+	return r.UpdatedAt
+}
+
+// cleanup runs a periodic background job that removes stale DB entries
+// whose VMs have disappeared or whose provisioning phase has timed out.
+func (s *Scheduler) cleanup(ctx context.Context) error {
+	if s.store == nil {
+		return nil
+	}
+
+	active, err := s.store.ListActive()
+	if err != nil {
+		return fmt.Errorf("list active runners: %w", err)
+	}
+
+	tartVMs, err := s.provisioner.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list tart VMs: %w", err)
+	}
+	tartSet := make(map[string]struct{}, len(tartVMs))
+	for _, n := range tartVMs {
+		tartSet[n] = struct{}{}
+	}
+
+	for _, r := range active {
+		lastActivity := updatedAt(r)
+		if r.State == "provisioning" && time.Since(lastActivity) > provisioningTimeout {
+			log.Printf("scheduler: cleanup: provisioning timeout for %s", r.InstanceName)
+			s.cleanupRunner(ctx, r)
+			continue
+		}
+		if _, ok := tartSet[r.InstanceName]; !ok {
+			log.Printf("scheduler: cleanup: VM %s missing from Tart, removing GitHub runner", r.InstanceName)
+			s.cleanupRunner(ctx, r)
+			continue
+		}
+	}
+
+	if n, err := s.store.HardPruneBefore(time.Now().UTC().Add(-7 * 24 * time.Hour)); err != nil {
+		return fmt.Errorf("prune old rows: %w", err)
+	} else if n > 0 {
+		s.debug.Printf("scheduler: cleanup: pruned %d old soft-deleted row(s)", n)
+	}
+
+	return nil
+}
+
+// cleanupRunner deletes a runner from GitHub and soft-deletes its DB row.
+// It tries the API first (using a cached runner ID if available), then
+// falls back to an SSH remove command if the VM is still alive.
+// Any stuck Tart VM is also force-stopped and deleted.
+func (s *Scheduler) cleanupRunner(ctx context.Context, r store.Runner) {
+	target := TargetRef{Owner: r.TargetOwner, Repo: r.TargetRepo}
+
+	if s.runnerCleaner != nil {
+		err := s.runnerCleaner.DeleteRunnerByName(ctx, target, r.InstanceName)
+		if err != nil {
+			log.Printf("scheduler: cleanup: API delete failed for %s: %v", r.InstanceName, err)
+			if s.guestRunner != nil && r.GuestIPString() != "" {
+				if sshErr := s.guestRunner.RemoveRunner(ctx, r.GuestIPString()); sshErr != nil {
+					log.Printf("scheduler: cleanup: SSH fallback failed for %s: %v", r.InstanceName, sshErr)
+				} else {
+					log.Printf("scheduler: cleanup: removed runner %s via SSH", r.InstanceName)
+				}
+			}
+		} else {
+			s.debug.Printf("scheduler: cleanup: removed runner %s via API", r.InstanceName)
+		}
+	}
+
+	if running, _ := s.provisioner.IsRunning(ctx, r.InstanceName); running {
+		if err := s.provisioner.Stop(ctx, r.InstanceName); err != nil {
+			log.Printf("scheduler: cleanup: stop %s failed: %v", r.InstanceName, err)
+		}
+		if err := s.provisioner.Delete(ctx, r.InstanceName); err != nil {
+			log.Printf("scheduler: cleanup: delete %s failed: %v", r.InstanceName, err)
+		}
+	}
+
+	if err := s.store.SoftDelete(r.InstanceName); err != nil {
+		log.Printf("scheduler: cleanup: soft delete %s failed: %v", r.InstanceName, err)
+	}
 }
